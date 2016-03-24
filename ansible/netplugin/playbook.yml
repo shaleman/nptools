@@ -1,0 +1,217 @@
+---
+
+- hosts: nodes
+  remote_user: vagrant
+  become: yes
+  become_method: sudo
+  vars:
+    contiv_network_version: "v0.1-03-16-2016.13-43-59.UTC"
+    contiv_network_tar_file: "netplugin-{{ contiv_network_version }}.tar.bz2"
+    contiv_network_src_file: "https://github.com/contiv/netplugin/releases/download/{{ contiv_network_version }}/{{ contiv_network_tar_file }}"
+    contiv_network_dest_file: "/tmp/{{ contiv_network_tar_file }}"
+    netplugin_upstart_file: /etc/init/netplugin.conf
+    netplugin_env_file: /etc/default/netplugin
+    netplugin_bin_file: /usr/bin/netplugin
+    netmaster_env_file: /etc/default/netmaster
+    netmaster_bin_file: /usr/bin/netmaster
+    netmaster_upstart_file: /etc/init/netmaster.conf
+    netplugin_mode: "docker"
+    netplugin_if: "eth2"
+    control_interface: "eth1"
+    fwd_mode: "bridge"
+    node_name: "{{ inventory_hostname }}"
+    node_addr: "{{ hostvars[inventory_hostname]['ansible_' + control_interface]['ipv4']['address'] }}"
+    docker_version: 1.10.1
+    etcd_master_name: "{{node_name}}"
+    etcd_master_addr: "{{node_addr}}"
+    etcd_client_port1: 2379
+    etcd_client_port2: 4001
+    etcd_peer_port1: 2380
+    etcd_peer_port2: 7001
+    etcd_peers_group: "nodes"
+    etcd_peer_interface: "{{ control_interface }}"
+    etcd_init_cluster: true
+    etcd_tmp_filename: "/tmp/etcd.existing"
+    etcd_upstart_file: /etc/init/etcd.conf
+
+  tasks:
+    # Basic setup
+      - name: upgrade system (debian)
+        apt:
+          update_cache: true
+          state: latest
+
+      - name: install base packages (debian)
+        apt:
+          name: "{{ item }}"
+        with_items:
+          - unzip
+          - bzip2
+          - vim-nox
+          - curl
+          - python-software-properties
+          - git
+          - mercurial
+          - build-essential
+          - perl
+          - librbd-dev
+          - lshw
+          - bash-completion
+
+      # Download and Install Etcd
+      - name: download etcd v2.1.1
+        get_url:
+          validate_certs: "no"
+          url: https://github.com/coreos/etcd/releases/download/v2.1.1/etcd-v2.1.1-linux-amd64.tar.gz
+          dest: /tmp/etcd-v2.1.1-linux-amd64.tar.gz
+          force: no
+
+      - name: install etcd
+        shell: creates=/usr/bin/etcd tar vxzf /tmp/etcd-v2.1.1-linux-amd64.tar.gz && mv etcd-v2.1.1-linux-amd64/etcd* /usr/bin
+
+      # Setup etcd upstart scripts and start etcd
+      - name: copy the etcd start/stop script
+        template: src=etcd.j2 dest=/usr/bin/etcd.sh mode=u=rwx,g=rx,o=rx
+
+      - name: configure etcd upstart file
+        shell: >
+            set -e;
+            echo "script" > /etc/init/etcd.conf;
+            echo "/usr/bin/etcd.sh start 1>/tmp/etcd.log 2>/tmp/etcd.log" >> /etc/init/etcd.conf;
+            echo "end script" >> /etc/init/etcd.conf;
+            echo "post-stop script" >> /etc/init/etcd.conf;
+            echo "/usr/bin/etcd.sh stop" >> /etc/init/etcd.conf;
+            echo "end script" >> /etc/init/etcd.conf;
+        become: true
+        when: ansible_distribution == 'Ubuntu' and ansible_lsb.major_release|int <= 14
+
+      - name: stop old etcd instance if its running
+        shell: >
+            set -e;
+            service etcd stop;
+        become: true
+        when: ansible_distribution == 'Ubuntu' and ansible_lsb.major_release|int <= 14
+        ignore_errors: yes
+
+      - name: start etcd
+        shell: >
+            set -e;
+            rm -rf /var/lib/etcd;
+            service etcd start
+        become: true
+        when: ansible_distribution == 'Ubuntu' and ansible_lsb.major_release|int <= 14
+
+      # Install docker if it doesnt exist
+      - name: check docker version
+        shell: docker --version
+        register: docker_installed_version
+        ignore_errors: yes
+
+      - name: install docker (debian)
+        shell: curl https://get.docker.com | sed 's/docker-engine/--force-yes docker-engine={{ docker_version }}-0~{{ ansible_distribution_release }}/' | bash
+        when: (ansible_os_family == "Debian") and not (docker_installed_version.stdout | match("Docker version {{ docker_version }}, build.*"))
+
+      - name: Enable cluster store for docker
+        copy: src=docker.j2 dest=/etc/default/docker
+
+      - name: restart docker
+        shell: "service docker restart"
+
+      # Download OpenVswitch
+      - name: download ovs binaries (debian)
+        get_url:
+          validate_certs: "no"
+          dest: "{{ item.dest }}"
+          url: "{{ item.url }}"
+        with_items:
+          - {
+              url: "https://cisco.box.com/shared/static/v1dvgoboo5zgqrtn6tu27vxeqtdo2bdl.deb",
+              dest: /tmp/ovs-common.deb
+            }
+          - {
+              url: "https://cisco.box.com/shared/static/ymbuwvt2qprs4tquextw75b82hyaxwon.deb",
+              dest: /tmp/ovs-switch.deb
+            }
+        when: ansible_os_family == "Debian"
+
+      # Install OpenVswitch
+      - name: install ovs-common (debian)
+        apt: "deb=/tmp/ovs-common.deb"
+        when: ansible_os_family == "Debian"
+
+      - name: install ovs (debian)
+        apt: "deb=/tmp/ovs-switch.deb"
+        when: ansible_os_family == "Debian"
+
+      - name: setup ovs
+        shell: "ovs-vsctl set-manager {{ item }}"
+        with_items:
+          - "tcp:127.0.0.1:6640"
+          - "ptcp:6640"
+
+      # pull skydns container for service discovery
+      - name: check dns container image
+        shell: docker inspect skynetservices/skydns
+        register: docker_inspect_result
+        ignore_errors: yes
+
+      - name: pull dns container image
+        shell: docker pull skynetservices/skydns
+        when: "'No such image' in docker_inspect_result.stderr"
+
+      # Download and Install Netplugin and Netmaster
+      - name: download netmaster and netplugin
+        get_url:
+          validate_certs: "no"
+          url: "{{ contiv_network_src_file }}"
+          dest: "{{ contiv_network_dest_file }}"
+        register: download_result
+
+      - name: ensure netplugin directory exists
+        file: path=/usr/bin/contiv/netplugin state=directory
+
+      - name: install netmaster and netplugin
+        shell: tar vxjf {{ contiv_network_dest_file }}
+        args:
+          chdir: /usr/bin/contiv/netplugin
+        when: download_result | changed
+
+      - name: create links for netplugin binaries
+        file: src=/usr/bin/contiv/netplugin/{{ item }} dest=/usr/bin/{{ item }} state=link force=yes
+        with_items:
+          - netctl
+          - netmaster
+          - netplugin
+          - contivk8s
+
+      # Setup upstart scripts for netplugin and start netplugin daemons
+      - name: setup environment file for netplugin
+        shell: >
+            set -e;
+            echo "NETPLUGIN_ARGS='-plugin-mode {{netplugin_mode}} -vlan-if {{netplugin_if}} -vtep-ip {{node_addr}} -ctrl-ip {{node_addr}} -fwd-mode {{fwd_mode}}'" > /etc/default/netplugin;
+
+      - name: setup environment file for netmaster
+        shell: >
+            set -e;
+            echo "NETMASTER_ARGS=\"\"" > /etc/default/netmaster;
+
+      - name: start netplugin
+        shell: >
+            set -e;
+            echo "script" > {{ netplugin_upstart_file }};
+            echo ". {{ netplugin_env_file }} && {{ netplugin_bin_file }} \$NETPLUGIN_ARGS  1>/tmp/netplugin.log 2>/tmp/netplugin.log" >> {{ netplugin_upstart_file }};
+            echo "end script" >> {{ netplugin_upstart_file }};
+            service netplugin restart;
+        become: true
+
+      - name: start netmaster
+        shell: >
+            set -e;
+            echo "script" > {{ netmaster_upstart_file }};
+            echo ". {{ netmaster_env_file }} && {{ netmaster_bin_file }} \$NETMASTER_ARGS  1>/tmp/netmaster.log 2>/tmp/netmaster.log" >> {{ netmaster_upstart_file }};
+            echo "end script" >> {{ netmaster_upstart_file }};
+            service netmaster restart;
+        become: true
+
+      - name: setup netmaster host alias
+        shell: echo "{{ node_addr }} netmaster" >> /etc/hosts
